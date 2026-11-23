@@ -455,7 +455,39 @@ def fallback_text_to_text(textlines, ignore_code: bool = False, clip=None):
     return output + "\n"
 
 
-def get_styled_text(spans):
+def resolve_links(links, span):
+    """Accept a span and return a markdown link string.
+
+    Args:
+        links: a list as returned by page.get_links()
+        span: a span dictionary as returned by page.get_text("dict")
+
+    Returns:
+        None or a string representing the link in MD format.
+    """
+    if not links:
+        return None
+
+    bbox = pymupdf.Rect(span["bbox"])  # span bbox
+    for link in links:
+        hot = link["from"]  # the hot area of the link
+        middle = (hot.tl + hot.br) / 2  # middle point of hot area
+        if not middle in bbox:
+            continue  # does not touch the bbox
+        text = span["text"].strip()
+        uri = link["uri"]
+        if text == uri and uri.lower().startswith(("http://", "https://")):
+            return None
+        # Escape characters that would mess up the generated markdown.
+        # See: https://bugs.ghostscript.com/show_bug.cgi?id=709173.
+        for c in "()\n":
+            uri = uri.replace(c, f"%{ord(c):02x}")
+        text = f"[{text}]({uri})"
+        return text
+    return None
+
+
+def get_styled_text(spans, links=None):
     """Output text with markdown style codes based on font properties.
     Parameter is a list of span dictionaries. The spans may come from
     one or more original "textlines" items.
@@ -518,12 +550,8 @@ def get_styled_text(spans):
 
         span_text = s["text"].strip()  # remove leading/trailing spaces
         # convert intersecting link to markdown syntax
-        # ltext = resolve_links(parms.links, s)
-        # ltext = ""  # TODO: implement link resolution
-        # if ltext:
-        #     text = f"{hdr_string}{prefix}{ltext}{suffix} "
-        # else:
-        #     text = f"{prefix}{span_text}{suffix} "
+        ltext = resolve_links(links, s)
+        span_text = ltext or span_text
         text = f"{prefix}{span_text}{suffix} "
         # Extend output string taking care of styles staying the same.
         if output.endswith(f"{suffix} "):
@@ -531,6 +559,7 @@ def get_styled_text(spans):
             # resolve hyphenation if old_block and old_line are not the same
             if (
                 1
+                and not ltext
                 and (old_block, old_line) != (s["block"], s["line"])
                 and output.endswith("-")
                 and len(output.split()[-1]) > 2
@@ -550,7 +579,7 @@ def get_styled_text(spans):
     return output, suffix
 
 
-def list_item_to_md(textlines, level):
+def list_item_to_md(textlines, level, links=None):
     """
     Convert "list-item" bboxes to markdown.
     The first line is prefixed with "- ". Subsequent lines are appended
@@ -593,7 +622,7 @@ def list_item_to_md(textlines, level):
     for line in textlines[1:]:
         this_x0 = line["bbox"][0]
         if this_x0 < x0 - 2:
-            line_output, suffix = get_styled_text(spans)
+            line_output, suffix = get_styled_text(spans, links=links)
             output += line_output + f"\n\n{indent}{starter}"
             spans = line["spans"]
             if not omit_if_pua_char(spans[0]["text"].strip()):
@@ -601,13 +630,13 @@ def list_item_to_md(textlines, level):
         else:
             spans.extend(line["spans"])
         x0 = this_x0  # store this left coordinate
-    line_output, suffix = get_styled_text(spans)
+    line_output, suffix = get_styled_text(spans, links=links)
     output += line_output
 
     return output + "\n\n"
 
 
-def footnote_to_md(textlines):
+def footnote_to_md(textlines, links=None):
     """
     Convert "footnote" bboxes to markdown.
     The first line is prefixed with "> ". Subsequent lines are appended
@@ -624,18 +653,18 @@ def footnote_to_md(textlines):
     output = "> "
     for line in textlines[1:]:
         if is_superscripted(line):
-            line_output, suffix = get_styled_text(spans)
+            line_output, suffix = get_styled_text(spans, links=links)
             output += line_output + "\n\n> "
             spans = line["spans"]
         else:
             spans.extend(line["spans"])
-    line_output, suffix = get_styled_text(spans)
+    line_output, suffix = get_styled_text(spans, links=links)
     output += line_output
 
     return output + "\n\n"
 
 
-def section_hdr_to_md(header_level, textlines):
+def section_hdr_to_md(header_level, textlines, links=None):
     """
     Convert "section-header" bboxes to markdown.
     """
@@ -644,11 +673,11 @@ def section_hdr_to_md(header_level, textlines):
         for s in l["spans"]:
             assert isinstance(s, dict)
             spans.append(s)
-    output, suffix = get_styled_text(spans)
+    output, suffix = get_styled_text(spans, links=links)
     return f"{'#' * header_level} {output}\n\n"
 
 
-def title_to_md(header_level, textlines):
+def title_to_md(header_level, textlines, links=None):
     """
     Convert "title" bboxes to markdown.
     The line text itself is handled like normal text.
@@ -659,7 +688,7 @@ def title_to_md(header_level, textlines):
         for s in l["spans"]:
             assert isinstance(s, dict)
             spans.append(s)
-    output, suffix = get_styled_text(spans)
+    output, suffix = get_styled_text(spans, links=links)
     return f"{'#' * header_level} {output}\n\n"
 
 
@@ -676,7 +705,7 @@ def code_block_to_md(textlines):
     return output
 
 
-def text_to_md(textlines, ignore_code: bool = False):
+def text_to_md(textlines, ignore_code: bool = False, links=None):
     """
     Convert "text" bboxes to markdown, as well as other boxclasses
     not specifically handled elsewhere.
@@ -687,7 +716,7 @@ def text_to_md(textlines, ignore_code: bool = False):
         return ""
     if is_superscripted(textlines[0]):
         # exec advanced superscript detector
-        return footnote_to_md(textlines)
+        return footnote_to_md(textlines, links=links)
     if not ignore_code and is_monospaced(textlines):
         return code_block_to_md(textlines)
 
@@ -696,7 +725,7 @@ def text_to_md(textlines, ignore_code: bool = False):
         for s in l["spans"]:
             assert isinstance(s, dict)
             spans.append(s)
-    output, suffix = get_styled_text(spans)
+    output, suffix = get_styled_text(spans, links=links)
     return output + "\n\n"
 
 
@@ -1082,20 +1111,28 @@ class ParsedDocument:
                     string_lengths.append(len(md_string))
                     continue
                 if btype == "title":
-                    md_string += title_to_md(box.header_level, box.textlines)
+                    md_string += title_to_md(
+                        box.header_level, box.textlines, links=page.links
+                    )
                     string_lengths.append(len(md_string))
                 elif btype == "section-header":
-                    md_string += section_hdr_to_md(box.header_level, box.textlines)
+                    md_string += section_hdr_to_md(
+                        box.header_level, box.textlines, links=page.links
+                    )
                     string_lengths.append(len(md_string))
                 elif btype == "list-item":
-                    md_string += list_item_to_md(box.textlines, list_item_levels[i])
+                    md_string += list_item_to_md(
+                        box.textlines, list_item_levels[i], links=page.links
+                    )
                     string_lengths.append(len(md_string))
                 elif btype == "footnote":
-                    md_string += footnote_to_md(box.textlines)
+                    md_string += footnote_to_md(box.textlines, links=page.links)
                     string_lengths.append(len(md_string))
                 else:  # treat as normal MD text
                     md_string += text_to_md(
-                        box.textlines, ignore_code=ignore_code or page.full_ocred
+                        box.textlines,
+                        ignore_code=ignore_code or page.full_ocred,
+                        links=page.links,
                     )
                     string_lengths.append(len(md_string))
             if page_separators:
